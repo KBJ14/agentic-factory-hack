@@ -323,7 +323,8 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.CognitiveServices/accounts', variables('aiFoundryName'))]",
-        "[resourceId('Microsoft.Insights/components', variables('applicationInsightsName'))]"
+        "[resourceId('Microsoft.Insights/components', variables('applicationInsightsName'))]",
+        "[resourceId('Microsoft.CognitiveServices/accounts/deployments', variables('aiFoundryName'), 'text-embedding-3-large')]"
       ]
     },
     {
@@ -341,7 +342,7 @@
         "useWorkspaceManagedIdentity": false,
         "isSharedToAll": true,
         "credentials": {
-          "key": "[reference(resourceId('Microsoft.Insights/components', variables('applicationInsightsName')), '2020-02-02').InstrumentationKey]"
+          "key": "[reference(resourceId('Microsoft.Insights/components', variables('applicationInsightsName')), '2020-02-02').ConnectionString]"
         },
         "metadata": {
           "ApiType": "Azure",
@@ -359,9 +360,9 @@
       },
       "properties": {
         "model": {
-          "name": "gpt-5.4-mini",
+          "name": "gpt-5-mini",
           "format": "OpenAI",
-          "version": "2026-03-17"
+          "version": "2025-08-07"
         }
       },
       "dependsOn": [
@@ -378,9 +379,9 @@
       },
       "properties": {
         "model": {
-          "name": "gpt-5.4",
+          "name": "gpt-5-mini",
           "format": "OpenAI",
-          "version": "2026-03-05"
+          "version": "2025-08-07"
         }
       },
       "dependsOn": [
