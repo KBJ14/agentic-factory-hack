@@ -128,7 +128,21 @@ public sealed class TextOnlyAgentExecutor : Executor<string, string>
             }
 
             agentStep.FinalMessage = outputText ?? "";
-            Console.WriteLine($"Agent {_agent.Name} completed with {agentStep.ToolCalls.Count} tool calls.");
+
+            // A2A agents report failure through the task state, not an exception:
+            // A2AAgent returns normally and exposes the A2A task as RawRepresentation.
+            if (response.RawRepresentation is A2A.AgentTask
+                {
+                    Status.State: A2A.TaskState.Failed or A2A.TaskState.Rejected or A2A.TaskState.Canceled
+                } failedTask)
+            {
+                agentStep.IsError = true;
+                Console.WriteLine($"Agent {_agent.Name} returned A2A task state {failedTask.Status.State}.");
+            }
+            else
+            {
+                Console.WriteLine($"Agent {_agent.Name} completed with {agentStep.ToolCalls.Count} tool calls.");
+            }
         }
         catch (Exception ex)
         {
@@ -145,6 +159,15 @@ public sealed class TextOnlyAgentExecutor : Executor<string, string>
         if (_onStepCompleted != null)
         {
             await _onStepCompleted(agentStep);
+        }
+
+        // A failed step must not feed its error text to the next agent as if it were a result.
+        // Throwing (after the step was recorded and reported) means no output message is sent,
+        // so downstream executors never run.
+        if (agentStep.IsError)
+        {
+            throw new InvalidOperationException(
+                $"Agent '{_agent.Name}' failed; workflow stopped. {agentStep.FinalMessage}");
         }
 
         // Return just the text for the next agent

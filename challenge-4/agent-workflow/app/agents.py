@@ -18,6 +18,126 @@ def extract_work_order_id(text: str) -> str | None:
     return match.group(0) if match else None
 
 
+# =============================================================================
+# Shared request handling for the Challenge-3 agents exposed over A2A
+# =============================================================================
+
+# Work orders in these states must not be scheduled or ordered again
+CLOSED_WORK_ORDER_STATUSES = {"completed", "closed", "cancelled"}
+
+
+class A2ARequestError(Exception):
+    """A request the agent refuses. Reported to the caller as a FAILED A2A task.
+
+    Raised before any Cosmos DB write, so nothing has been changed when it is seen.
+    """
+
+
+def require_work_order_id(query: str | None) -> str:
+    """Return the work order ID from the request; never fall back to a default ID."""
+    work_order_id = extract_work_order_id(query) if query else None
+    if not work_order_id:
+        raise A2ARequestError(
+            "No work order ID (format wo-YYYY-xxxx) found in the request; nothing was changed.")
+    return work_order_id
+
+
+async def load_open_work_order(cosmos_service, work_order_id: str):
+    """Load a work order that exists and is still open, or raise A2ARequestError."""
+    try:
+        work_order = await cosmos_service.get_work_order(work_order_id)
+    except Exception as e:
+        raise A2ARequestError(
+            f"Work order {work_order_id} could not be loaded ({e}); nothing was changed.") from e
+    if (work_order.status or "").lower() in CLOSED_WORK_ORDER_STATUSES:
+        raise A2ARequestError(
+            f"Work order {work_order_id} has status '{work_order.status}' and cannot be "
+            "processed; nothing was changed.")
+    return work_order
+
+
+async def run_maintenance_scheduler(work_order_id: str, cosmos_service, agent) -> str:
+    """Schedule maintenance for one open work order. Returns the response text."""
+    work_order = await load_open_work_order(cosmos_service, work_order_id)
+    logger.info(f"Found work order: {work_order.id} for machine: {work_order.machine_id}")
+
+    history = await cosmos_service.get_maintenance_history(work_order.machine_id)
+    windows = await cosmos_service.get_available_maintenance_windows(14)
+    schedule = await agent.predict_schedule(work_order, history, windows)
+
+    await cosmos_service.save_maintenance_schedule(schedule)
+    return (
+        f"Maintenance Schedule Created:\n"
+        f"- Schedule ID: {schedule.id}\n"
+        f"- Machine: {schedule.machine_id}\n"
+        f"- Scheduled Date: {schedule.scheduled_date}\n"
+        f"- Risk Score: {schedule.risk_score}/100\n"
+        f"- Failure Probability: {schedule.predicted_failure_probability * 100:.1f}%\n"
+        f"- Recommended Action: {schedule.recommended_action}\n"
+        f"- Reasoning: {schedule.reasoning}"
+    )
+
+
+async def run_parts_ordering(work_order_id: str, cosmos_service, agent) -> str:
+    """Order parts for one open work order. Returns the response text.
+
+    Uses the same rules as the Challenge-3 CLI: shortages come from live inventory
+    (assess_parts), and an order is saved only if validate_order accepts it. The
+    work order status changes only after the order has been saved.
+    """
+    from parts_ordering_agent import assess_parts, validate_order
+
+    work_order = await load_open_work_order(cosmos_service, work_order_id)
+    part_numbers = [p.part_number for p in work_order.required_parts]
+    inventory = await cosmos_service.get_inventory_items(part_numbers)
+
+    shortages, _ = assess_parts(work_order, inventory)
+    if not shortages:
+        await cosmos_service.update_work_order_status(work_order.id, "Ready")
+        return "All required parts are available in stock. No parts order needed."
+
+    suppliers = await cosmos_service.get_suppliers_for_parts([s.part_number for s in shortages])
+    if not suppliers:
+        raise A2ARequestError(
+            f"No suppliers found for short parts of {work_order.id}; nothing was changed.")
+
+    order = await agent.generate_order(work_order, inventory, suppliers, shortages)
+    errors = validate_order(order, shortages, suppliers)
+    if errors:
+        raise A2ARequestError(
+            f"Parts order for {work_order.id} rejected (not saved, work order status "
+            "unchanged):\n" + "\n".join(f"- {e}" for e in errors))
+
+    await cosmos_service.save_parts_order(order)
+    await cosmos_service.update_work_order_status(work_order.id, "PartsOrdered")
+    return (
+        f"Parts Order Generated:\n"
+        f"- Order ID: {order.id}\n"
+        f"- Work Order: {order.work_order_id}\n"
+        f"- Supplier: {order.supplier_name}\n"
+        f"- Expected Delivery: {order.expected_delivery_date}\n"
+        f"- Total Cost: ${order.total_cost:.2f}\n"
+        f"- Items: {len(order.order_items)} part(s)"
+    )
+
+
+async def finish_a2a_task(updater, response_text: str, succeeded: bool) -> None:
+    """Publish the response and end the task as COMPLETED or FAILED.
+
+    On failure the text is attached both as the artifact and as the FAILED status
+    message, so A2A clients see a failed task instead of a normal completion.
+    """
+    from a2a.helpers import new_text_message
+    from a2a.types import Part
+
+    await updater.add_artifact(parts=[Part(text=response_text)], name='response', last_chunk=True)
+    if succeeded:
+        await updater.complete()
+    else:
+        await updater.failed(message=new_text_message(
+            response_text, context_id=updater.context_id, task_id=updater.task_id))
+
+
 # Add challenge-3 agents to the Python path for in-place imports
 # This path is relative to this file's location: challenge-4/agent-workflow/app -> challenge-3/agents
 CHALLENGE_3_PATH = os.path.abspath(os.path.join(
@@ -122,21 +242,19 @@ def create_maintenance_scheduler_a2a_app():
                 from services.cosmos_db_service import CosmosDbService
             except (ImportError, OSError) as import_err:
                 logger.exception("Failed to import challenge-3 agents")
-                response_text = f"Error: Failed to import required modules: {str(import_err)}"
-                await updater.add_artifact(
-                    parts=[Part(text=response_text)],
-                    name='response',
-                    last_chunk=True,
-                )
-                await updater.complete()
+                await finish_a2a_task(
+                    updater, f"Error: Failed to import required modules: {str(import_err)}", False)
                 return
 
+            succeeded = False
             try:
-                # Extract the message text from user_message
                 logger.info(
                     f"MaintenanceSchedulerExecutor received message: {query}")
 
-                # Initialize services
+                # Validate the work order ID before touching Cosmos DB (no default fallback)
+                work_order_id = require_work_order_id(query)
+                logger.info(f"Looking up work order: '{work_order_id}'")
+
                 cosmos_endpoint = os.getenv("COSMOS_ENDPOINT")
                 cosmos_key = os.getenv("COSMOS_KEY")
                 database_name = os.getenv(
@@ -144,54 +262,25 @@ def create_maintenance_scheduler_a2a_app():
                 project_endpoint = os.getenv("AI_FOUNDRY_PROJECT_ENDPOINT") or os.getenv(
                     "AZURE_AI_PROJECT_ENDPOINT")
                 deployment_name = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-5.4")
-
                 if not all([cosmos_endpoint, cosmos_key, database_name, project_endpoint]):
-                    response_text = "Error: Missing required environment variables for MaintenanceSchedulerAgent"
-                else:
-                    cosmos_service = CosmosDbService(
-                        cosmos_endpoint, cosmos_key, database_name)
-                    agent = MaintenanceSchedulerAgent(
-                        project_endpoint, deployment_name, cosmos_service)
+                    raise A2ARequestError(
+                        "Missing required environment variables for MaintenanceSchedulerAgent")
 
-                    # Parse work order ID from input (default matches challenge-3 maintenance_scheduler_agent.py)
-                    work_order_id = extract_work_order_id(
-                        query) if query else None
-                    if not work_order_id:
-                        work_order_id = "wo-2024-468"  # fallback default
-                    logger.info(f"Looking up work order: '{work_order_id}'")
+                cosmos_service = CosmosDbService(
+                    cosmos_endpoint, cosmos_key, database_name)
+                agent = MaintenanceSchedulerAgent(
+                    project_endpoint, deployment_name, cosmos_service)
 
-                    # Get work order and run prediction
-                    work_order = await cosmos_service.get_work_order(work_order_id)
-                    logger.info(
-                        f"Found work order: {work_order.id} for machine: {work_order.machine_id}")
-                    history = await cosmos_service.get_maintenance_history(work_order.machine_id)
-                    windows = await cosmos_service.get_available_maintenance_windows(14)
-
-                    schedule = await agent.predict_schedule(work_order, history, windows)
-
-                    response_text = (
-                        f"Maintenance Schedule Created:\n"
-                        f"- Schedule ID: {schedule.id}\n"
-                        f"- Machine: {schedule.machine_id}\n"
-                        f"- Scheduled Date: {schedule.scheduled_date}\n"
-                        f"- Risk Score: {schedule.risk_score}/100\n"
-                        f"- Failure Probability: {schedule.predicted_failure_probability * 100:.1f}%\n"
-                        f"- Recommended Action: {schedule.recommended_action}\n"
-                        f"- Reasoning: {schedule.reasoning}"
-                    )
-
-                    await cosmos_service.save_maintenance_schedule(schedule)
-
+                response_text = await run_maintenance_scheduler(work_order_id, cosmos_service, agent)
+                succeeded = True
+            except A2ARequestError as e:
+                logger.warning(f"MaintenanceSchedulerAgent refused request: {e}")
+                response_text = f"Error: {e}"
             except Exception as e:
                 logger.exception("MaintenanceSchedulerAgent error")
                 response_text = f"Error processing maintenance schedule request: {str(e)}"
 
-            await updater.add_artifact(
-                parts=[Part(text=response_text)],
-                name='response',
-                last_chunk=True,
-            )
-            await updater.complete()
+            await finish_a2a_task(updater, response_text, succeeded)
 
         async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
             pass
@@ -290,17 +379,17 @@ def create_parts_ordering_a2a_app():
                 from services.cosmos_db_service import CosmosDbService
             except (ImportError, OSError) as import_err:
                 logger.exception("Failed to import challenge-3 agents")
-                response_text = f"Error: Failed to import required modules: {str(import_err)}"
-                await updater.add_artifact(
-                    parts=[Part(text=response_text)],
-                    name='response',
-                    last_chunk=True,
-                )
-                await updater.complete()
+                await finish_a2a_task(
+                    updater, f"Error: Failed to import required modules: {str(import_err)}", False)
                 return
 
+            succeeded = False
             try:
-                # Initialize services
+                logger.info(f"PartsOrderingExecutor received message: {query}")
+
+                # Validate the work order ID before touching Cosmos DB (no default fallback)
+                work_order_id = require_work_order_id(query)
+
                 cosmos_endpoint = os.getenv("COSMOS_ENDPOINT")
                 cosmos_key = os.getenv("COSMOS_KEY")
                 database_name = os.getenv(
@@ -308,66 +397,25 @@ def create_parts_ordering_a2a_app():
                 project_endpoint = os.getenv("AI_FOUNDRY_PROJECT_ENDPOINT") or os.getenv(
                     "AZURE_AI_PROJECT_ENDPOINT")
                 deployment_name = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-5.4")
-
                 if not all([cosmos_endpoint, cosmos_key, database_name, project_endpoint]):
-                    response_text = "Error: Missing required environment variables for PartsOrderingAgent"
-                else:
-                    cosmos_service = CosmosDbService(
-                        cosmos_endpoint, cosmos_key, database_name)
-                    agent = PartsOrderingAgent(
-                        project_endpoint, deployment_name, cosmos_service)
+                    raise A2ARequestError(
+                        "Missing required environment variables for PartsOrderingAgent")
 
-                    # Parse work order ID from input (default matches challenge-3 parts_ordering_agent.py)
-                    work_order_id = extract_work_order_id(
-                        query) if query else None
-                    if not work_order_id:
-                        work_order_id = "wo-2024-468"  # fallback default
+                cosmos_service = CosmosDbService(
+                    cosmos_endpoint, cosmos_key, database_name)
+                agent = PartsOrderingAgent(
+                    project_endpoint, deployment_name, cosmos_service)
 
-                    # Get work order and generate order
-                    work_order = await cosmos_service.get_work_order(work_order_id)
-                    part_numbers = [
-                        p.part_number for p in work_order.required_parts]
-                    inventory = await cosmos_service.get_inventory_items(part_numbers)
-
-                    parts_needing_order = [
-                        p for p in work_order.required_parts if not p.is_available]
-
-                    if not parts_needing_order:
-                        response_text = "All required parts are available in stock. No parts order needed."
-                        await cosmos_service.update_work_order_status(work_order.id, "Ready")
-                    else:
-                        needed_part_numbers = [
-                            p.part_number for p in parts_needing_order]
-                        suppliers = await cosmos_service.get_suppliers_for_parts(needed_part_numbers)
-
-                        if not suppliers:
-                            response_text = "Error: No suppliers found for required parts."
-                        else:
-                            order = await agent.generate_order(work_order, inventory, suppliers)
-
-                            response_text = (
-                                f"Parts Order Generated:\n"
-                                f"- Order ID: {order.id}\n"
-                                f"- Work Order: {order.work_order_id}\n"
-                                f"- Supplier: {order.supplier_name}\n"
-                                f"- Expected Delivery: {order.expected_delivery_date}\n"
-                                f"- Total Cost: ${order.total_cost:.2f}\n"
-                                f"- Items: {len(order.order_items)} part(s)"
-                            )
-
-                            await cosmos_service.save_parts_order(order)
-                            await cosmos_service.update_work_order_status(work_order.id, "PartsOrdered")
-
+                response_text = await run_parts_ordering(work_order_id, cosmos_service, agent)
+                succeeded = True
+            except A2ARequestError as e:
+                logger.warning(f"PartsOrderingAgent refused request: {e}")
+                response_text = f"Error: {e}"
             except Exception as e:
                 logger.exception("PartsOrderingAgent error")
                 response_text = f"Error processing parts order request: {str(e)}"
 
-            await updater.add_artifact(
-                parts=[Part(text=response_text)],
-                name='response',
-                last_chunk=True,
-            )
-            await updater.complete()
+            await finish_a2a_task(updater, response_text, succeeded)
 
         async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
             pass
