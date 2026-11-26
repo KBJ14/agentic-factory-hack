@@ -68,6 +68,7 @@ async def run_maintenance_scheduler(work_order_id: str, cosmos_service, agent) -
     await cosmos_service.save_maintenance_schedule(schedule)
     return (
         f"Maintenance Schedule Created:\n"
+        f"- Work Order: {work_order.id}\n"
         f"- Schedule ID: {schedule.id}\n"
         f"- Machine: {schedule.machine_id}\n"
         f"- Scheduled Date: {schedule.scheduled_date}\n"
