@@ -11,7 +11,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional
 
+from azure.core import MatchConditions
 from azure.cosmos import CosmosClient, PartitionKey, exceptions
+
+# Properties that Cosmos DB adds to every stored document. They must not be copied
+# when a document is re-created in another partition; every other field is kept.
+COSMOS_SYSTEM_PROPERTIES = frozenset({"_rid", "_self", "_etag", "_attachments", "_ts", "_lsn"})
 
 # =============================================================================
 # Shared Models
@@ -231,35 +236,112 @@ class CosmosDbService:
             raise Exception(f"Work order {work_order_id} not found: {str(e)}")
 
     async def update_work_order_status(self, work_order_id: str, status: str):
-        """Update work order status."""
+        """Change a work order's status while preserving all of its business fields.
+
+        The only changes to the document are:
+          - ``status`` is set to the new value
+          - ``statusUpdatedAt`` (UTC ISO 8601) is added/overwritten
+        Every other field is copied as-is; only Cosmos system properties
+        (COSMOS_SYSTEM_PROPERTIES) are dropped.
+
+        ``status`` is the partition key of the WorkOrders container, so changing it
+        means moving the document to another partition. Cosmos DB cannot do that
+        atomically, so the move is ordered to never lose the work order:
+          1. read the full original document (and its ETag)
+          2. create the new copy in the new partition first
+             -> if this fails, the original is untouched
+          3. delete the original, only if it was not modified since step 1 (ETag)
+          4. if that delete raises, re-read the original partition to find out
+             what actually happened:
+             - original is gone      -> keep the new copy (the move completed)
+             - original still exists -> roll back by deleting the new copy, only if
+                                        it is unchanged since we created it (ETag)
+             - cannot tell           -> keep the new copy and raise an error
+        """
 
         container = self.database.get_container_client("WorkOrders")
-        work_order = await self.get_work_order(work_order_id)
-        old_status = work_order.status
 
-        container.delete_item(item=work_order_id, partition_key=old_status)
+        # 1. Read the full raw document (the WorkOrder model would drop fields)
+        docs = list(
+            container.query_items(
+                query="SELECT * FROM c WHERE c.id = @id",
+                parameters=[{"name": "@id", "value": work_order_id}],
+                enable_cross_partition_query=True,
+            )
+        )
+        if not docs:
+            raise ValueError(f"Work order {work_order_id} not found")
+        if len(docs) > 1:
+            partitions = ", ".join(repr(d.get("status")) for d in docs)
+            raise RuntimeError(
+                f"Work order {work_order_id} exists in several partitions ({partitions}); "
+                "resolve the duplicate manually before changing its status"
+            )
 
-        item = {
-            "id": work_order.id,
-            "machineId": work_order.machine_id,
-            "faultType": work_order.fault_type,
-            "priority": work_order.priority,
-            "assignedTechnician": work_order.assigned_technician,
-            "requiredParts": [
-                {
-                    "partNumber": p.part_number,
-                    "partName": p.part_name,
-                    "quantity": p.quantity,
-                    "isAvailable": p.is_available,
-                }
-                for p in work_order.required_parts
-            ],
-            "estimatedDuration": work_order.estimated_duration,
-            "createdAt": work_order.created_at.isoformat() if work_order.created_at else None,
-            "status": status,
-        }
+        original = docs[0]
+        old_status = original.get("status")
+        if old_status == status:
+            return  # already in the requested status; nothing to move
 
-        container.upsert_item(body=item)
+        updated = {k: v for k, v in original.items() if k not in COSMOS_SYSTEM_PROPERTIES}
+        updated["status"] = status
+        updated["statusUpdatedAt"] = datetime.utcnow().isoformat() + "Z"
+
+        # 2. Create the new copy first. create_item (not upsert) fails with a conflict
+        #    instead of overwriting a copy left behind by an earlier interrupted move.
+        created = container.create_item(body=updated)
+        new_etag = created["_etag"]
+
+        # 3. Delete the original only if nobody modified it after we read it
+        try:
+            container.delete_item(
+                item=work_order_id,
+                partition_key=old_status,
+                etag=original["_etag"],
+                match_condition=MatchConditions.IfNotModified,
+            )
+            return
+        except Exception as delete_error:
+            # 4. The delete raised, but it may still have been applied (e.g. a timeout
+            #    after the server deleted it). Check the original partition.
+            try:
+                container.read_item(item=work_order_id, partition_key=old_status)
+            except exceptions.CosmosResourceNotFoundError:
+                # Original is gone: the move completed, keep the new copy.
+                print(
+                    f"   ⚠️ Deleting the old copy of {work_order_id} raised "
+                    f"({delete_error}), but it is already gone; keeping status '{status}'."
+                )
+                return
+            except Exception as read_error:
+                # Cannot tell whether the original still exists: keep the new copy
+                # (never risk losing the work order) and report it.
+                raise RuntimeError(
+                    f"Work order {work_order_id}: could not delete the copy in "
+                    f"'{old_status}' ({delete_error}) and could not verify it "
+                    f"({read_error}). The new copy in '{status}' was kept; check "
+                    "for a duplicate."
+                ) from delete_error
+
+            # Original still exists: roll back the new copy, but only if it is
+            # unchanged since we created it (do not delete someone else's update).
+            try:
+                container.delete_item(
+                    item=work_order_id,
+                    partition_key=status,
+                    etag=new_etag,
+                    match_condition=MatchConditions.IfNotModified,
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"Work order {work_order_id}: could not delete the copy in "
+                    f"'{old_status}' ({delete_error}) and the rollback of the copy in "
+                    f"'{status}' failed ({rollback_error}). It now exists in both "
+                    "partitions; resolve manually."
+                ) from delete_error
+
+            # Rolled back: the original is unchanged; report the failed status change.
+            raise
 
     # -------------------------------------------------------------------------
     # Maintenance data

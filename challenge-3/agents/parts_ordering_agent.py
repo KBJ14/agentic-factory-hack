@@ -14,8 +14,9 @@ import logging
 import os
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional, Tuple
 
 from agent_framework import Agent
 from agent_framework.foundry import FoundryChatClient
@@ -37,6 +38,125 @@ from services.cosmos_db_service import (
 logger = logging.getLogger(__name__)
 load_dotenv(override=True)
 
+# CLI exit codes (run-batch.py treats any non-zero code as a failed run)
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_ORDER_REJECTED = 2
+
+
+# =============================================================================
+# Shortage assessment and order validation (deterministic, no AI)
+# =============================================================================
+
+
+@dataclass
+class PartShortage:
+    """A part this work order cannot be completed without (on hand < required)."""
+
+    part_number: str
+    part_name: str
+    required_qty: int
+    on_hand: int
+    shortfall: int  # required_qty - on_hand, always > 0
+
+
+@dataclass
+class ReplenishmentAdvice:
+    """Informational only: stock left after this job is at/below the reorder point.
+
+    This is a warehouse restocking signal, separate from the work order's needs.
+    It never triggers an order or a work order status change in this agent.
+    """
+
+    part_number: str
+    part_name: str
+    on_hand_after_job: int
+    reorder_point: int
+
+
+def assess_parts(
+    work_order: WorkOrder, inventory: List[InventoryItem]
+) -> Tuple[List[PartShortage], List[ReplenishmentAdvice]]:
+    """Compare actual stock with the quantity this work order needs.
+
+    The work order's stored ``isAvailable`` flags are ignored; only live inventory counts.
+    A part without an inventory record is treated as 0 on hand.
+    """
+    stock = {item.part_number.upper(): item for item in inventory}
+    shortages: List[PartShortage] = []
+    advice: List[ReplenishmentAdvice] = []
+
+    for part in work_order.required_parts:
+        need = max(int(part.quantity or 0), 0)
+        item = stock.get(part.part_number.upper())
+        on_hand = item.current_stock if item else 0
+
+        if on_hand < need:
+            shortages.append(PartShortage(
+                part_number=part.part_number,
+                part_name=part.part_name or (item.part_name if item else ""),
+                required_qty=need,
+                on_hand=on_hand,
+                shortfall=need - on_hand,
+            ))
+        elif item and on_hand - need <= item.reorder_point:
+            advice.append(ReplenishmentAdvice(
+                part_number=part.part_number,
+                part_name=part.part_name or item.part_name,
+                on_hand_after_job=on_hand - need,
+                reorder_point=item.reorder_point,
+            ))
+
+    return shortages, advice
+
+
+def validate_order(
+    order: PartsOrder, shortages: List[PartShortage], suppliers: List[Supplier]
+) -> List[str]:
+    """Return the reasons an order cannot be accepted (empty list = valid).
+
+    A valid order has a known supplier that supplies every short part, and orders
+    exactly the shortfall of each short part: no missing, excess or unneeded items.
+    """
+    errors: List[str] = []
+    known_suppliers = {s.id: s for s in suppliers}
+    shortfall_by_part = {s.part_number.upper(): s for s in shortages}
+
+    if not order.supplier_id:
+        errors.append("no supplier selected")
+    elif order.supplier_id not in known_suppliers:
+        errors.append(f"unknown supplier '{order.supplier_id}'")
+
+    if not order.order_items:
+        errors.append("order has no items")
+
+    ordered_qty: dict = {}
+    for item in order.order_items:
+        key = (item.part_number or "").upper()
+        if not key:
+            errors.append("order item without a part number")
+            continue
+        if key not in shortfall_by_part:
+            errors.append(f"{item.part_number}: not needed (no shortage for this part)")
+            continue
+        if item.quantity <= 0:
+            errors.append(f"{item.part_number}: invalid quantity {item.quantity}")
+            continue
+        ordered_qty[key] = ordered_qty.get(key, 0) + item.quantity
+
+    supplier = known_suppliers.get(order.supplier_id)
+    supplier_parts = {p.upper() for p in supplier.parts} if supplier else set()
+    for key, shortage in shortfall_by_part.items():
+        got = ordered_qty.get(key, 0)
+        if got < shortage.shortfall:
+            errors.append(f"{shortage.part_number}: ordered {got}, needs {shortage.shortfall}")
+        elif got > shortage.shortfall:
+            errors.append(f"{shortage.part_number}: ordered {got}, exceeds shortfall {shortage.shortfall}")
+        if supplier and key not in supplier_parts:
+            errors.append(f"{supplier.id} does not supply {shortage.part_number}")
+
+    return errors
+
 
 # =============================================================================
 # Agent Service
@@ -57,10 +177,19 @@ class PartsOrderingAgent:
         work_order: WorkOrder,
         inventory: List[InventoryItem],
         suppliers: List[Supplier],
+        shortages: Optional[List[PartShortage]] = None,
     ) -> PartsOrder:
-        """Generate optimized parts order using AI"""
+        """Generate optimized parts order using AI.
 
-        context = self._build_context(work_order, inventory, suppliers)
+        ``shortages`` is optional so existing callers (e.g. Challenge 4) keep working;
+        when omitted it is computed from live inventory. The returned order is NOT
+        validated here; callers must run ``validate_order`` before saving it.
+        """
+
+        if shortages is None:
+            shortages, _ = assess_parts(work_order, inventory)
+
+        context = self._build_context(work_order, inventory, suppliers, shortages)
         chat_history_json = await self.cosmos_service.get_work_order_chat_history(work_order.id)
         print(
             f"   Using persistent chat history for work order: {work_order.id}")
@@ -107,17 +236,19 @@ Always respond in valid JSON format as requested."""
         json_response = self._extract_json(response_text)
         data = json.loads(json_response)
 
-        order_items = [
-            OrderItem(
-                part_number=item["partNumber"],
-                part_name=item["partName"],
-                quantity=item["quantity"],
-                unit_cost=item.get("unitCost") or 0.0,
-                total_cost=item.get("totalCost") or (
-                    item["quantity"] * (item.get("unitCost") or 0.0)),
-            )
-            for item in data["orderItems"]
-        ]
+        # Use .get() everywhere: missing keys become empty values that
+        # validate_order() rejects, instead of crashing with KeyError.
+        order_items = []
+        for item in data.get("orderItems") or []:
+            quantity = int(item.get("quantity") or 0)
+            unit_cost = float(item.get("unitCost") or 0.0)
+            order_items.append(OrderItem(
+                part_number=item.get("partNumber") or "",
+                part_name=item.get("partName") or "",
+                quantity=quantity,
+                unit_cost=unit_cost,
+                total_cost=float(item.get("totalCost") or quantity * unit_cost),
+            ))
         # Fall back to summing item costs if the model omitted/nulled the order total
         total_cost = data.get("totalCost")
         if total_cost is None:
@@ -138,8 +269,8 @@ Always respond in valid JSON format as requested."""
             id=f"PO-{str(uuid.uuid4())[:8]}",
             work_order_id=work_order.id,
             order_items=order_items,
-            supplier_id=data["supplierId"],
-            supplier_name=data["supplierName"],
+            supplier_id=data.get("supplierId") or "",
+            supplier_name=data.get("supplierName") or "",
             total_cost=total_cost,
             expected_delivery_date=expected_delivery_date,
             order_status="Pending",
@@ -163,8 +294,11 @@ Always respond in valid JSON format as requested."""
         work_order: WorkOrder,
         inventory: List[InventoryItem],
         suppliers: List[Supplier],
+        shortages: List[PartShortage],
     ) -> str:
         """Build analysis context for AI"""
+
+        shortage_by_part = {s.part_number.upper(): s for s in shortages}
 
         lines = [
             "# Parts Ordering Analysis Request",
@@ -183,22 +317,29 @@ Always respond in valid JSON format as requested."""
         for part in work_order.required_parts:
             lines.append(f"- **{part.part_name}** (Part#: {part.part_number})")
             lines.append(f"  * Quantity needed: {part.quantity}")
+            shortage = shortage_by_part.get(part.part_number.upper())
+            if shortage:
+                lines.append(
+                    f"  * SHORTAGE: on hand {shortage.on_hand}, order exactly {shortage.shortfall}")
+            else:
+                lines.append("  * Covered by current stock (do not order)")
+
+        lines.extend(["", "## Parts To Order (computed from live inventory)"])
+        for s in shortages:
             lines.append(
-                f"  * Available in stock: {'YES' if part.is_available else 'NO'}")
+                f"- {s.part_number} ({s.part_name}): order exactly {s.shortfall} "
+                f"(needed {s.required_qty}, on hand {s.on_hand})")
 
         lines.extend(["", "## Current Inventory Status"])
 
         if inventory:
             for item in inventory:
-                needs_order = item.current_stock <= item.reorder_point
                 lines.append(
                     f"- **{item.part_name}** (Part#: {item.part_number})")
                 lines.append(f"  * Current Stock: {item.current_stock}")
                 lines.append(f"  * Minimum Stock: {item.min_stock}")
-                lines.append(f"  * Reorder Point: {item.reorder_point}")
+                lines.append(f"  * Reorder Point: {item.reorder_point} (warehouse restocking only)")
                 lines.append(f"  * Unit Cost: ${item.unit_cost:.2f}")
-                lines.append(
-                    f"  * Status: {'⚠️  NEEDS ORDERING' if needs_order else '✓ Adequate'}")
                 lines.append(f"  * Location: {item.location}")
         else:
             lines.append("⚠️  No inventory records found for required parts.")
@@ -223,7 +364,8 @@ Always respond in valid JSON format as requested."""
                 "",
                 "## Analysis Required",
                 "Please provide a JSON response with:",
-                "1. Parts to order",
+                "1. Parts to order: ONLY the parts listed under 'Parts To Order', each with "
+                "exactly the quantity given there. Do not add other parts or extra quantity.",
                 "2. Optimal supplier selection (reliability > lead time > cost)",
                 "3. Expected delivery date",
                 "4. Total order cost",
@@ -275,8 +417,8 @@ Always respond in valid JSON format as requested."""
 # =============================================================================
 
 
-async def main():
-    """Main program"""
+async def main() -> int:
+    """Main program. Returns the CLI exit code (EXIT_OK / EXIT_ERROR / EXIT_ORDER_REJECTED)."""
 
     print("=== Parts Ordering Agent ===\n")
 
@@ -291,7 +433,7 @@ async def main():
     if not all([cosmos_endpoint, cosmos_key, database_name, foundry_project_endpoint]):
         print("Error: Missing required environment variables.")
         print("Required: COSMOS_ENDPOINT, COSMOS_KEY, COSMOS_DATABASE_NAME, AI_FOUNDRY_PROJECT_ENDPOINT")
-        return
+        return EXIT_ERROR
 
     if otel_exporter_endpoint:
         configure_otel_providers()
@@ -389,17 +531,22 @@ Always respond in valid JSON format with: supplierId, supplierName, orderItems (
             print(f"   Priority: {work_order.priority}\n")
         except Exception as e:
             print(f"   ✗ Error: {str(e)}")
-            return
+            return EXIT_ERROR
 
         print("2. Checking inventory status...")
         part_numbers = [p.part_number for p in work_order.required_parts]
         inventory = await cosmos_service.get_inventory_items(part_numbers)
         print(f"   ✓ Found {len(inventory)} inventory records\n")
 
-        parts_needing_order = [
-            p for p in work_order.required_parts if not p.is_available]
+        # Decide from live stock vs. the quantity this job needs (not the stored isAvailable flags).
+        shortages, replenishment = assess_parts(work_order, inventory)
+        for advice in replenishment:
+            print(
+                f"   ℹ️  Replenishment advised: {advice.part_name} ({advice.part_number}) "
+                f"leaves {advice.on_hand_after_job} after this job (reorder point "
+                f"{advice.reorder_point}); not ordered by this agent")
 
-        if not parts_needing_order:
+        if not shortages:
             print("✓ All required parts are available in stock!")
             print("No parts order needed.\n")
 
@@ -408,25 +555,36 @@ Always respond in valid JSON format with: supplierId, supplierName, orderItems (
             print("   ✓ Work order status updated to 'Ready'\n")
 
             print("✓ Parts Ordering Agent completed successfully!")
-            return
+            return EXIT_OK
 
-        print(f"⚠️  {len(parts_needing_order)} part(s) need to be ordered:")
-        for part in parts_needing_order:
-            print(f"   - {part.part_name} (Qty: {part.quantity})")
+        print(f"⚠️  {len(shortages)} part(s) need to be ordered:")
+        for s in shortages:
+            print(f"   - {s.part_name} (need {s.required_qty}, on hand {s.on_hand}, order {s.shortfall})")
         print()
 
         print("3. Finding suppliers...")
-        needed_part_numbers = [p.part_number for p in parts_needing_order]
+        needed_part_numbers = [s.part_number for s in shortages]
         suppliers = await cosmos_service.get_suppliers_for_parts(needed_part_numbers)
         print(f"   ✓ Found {len(suppliers)} potential suppliers\n")
 
         if not suppliers:
             print("✗ No suppliers found for required parts!")
-            return
+            return EXIT_ERROR
 
         print("4. Running AI parts ordering analysis...")
         try:
-            order = await agent_service.generate_order(work_order, inventory, suppliers)
+            order = await agent_service.generate_order(work_order, inventory, suppliers, shortages)
+
+            # Gate: never save an order or change the work order unless the order covers
+            # exactly the shortages with a valid supplier.
+            errors = validate_order(order, shortages, suppliers)
+            if errors:
+                print("   ✗ Parts order rejected:")
+                for error in errors:
+                    print(f"     - {error}")
+                print("   Order NOT saved; work order status unchanged.")
+                return EXIT_ORDER_REJECTED
+
             print("   ✓ Parts order generated!\n")
 
             print("=== Parts Order ===")
@@ -453,12 +611,14 @@ Always respond in valid JSON format with: supplierId, supplierName, orderItems (
             print("   ✓ Work order status updated to 'PartsOrdered'\n")
 
             print("✓ Parts Ordering Agent completed successfully!")
+            return EXIT_OK
         except Exception as e:
             print(f"   ✗ Error during parts ordering: {str(e)}")
             import traceback
 
             print(f"\nStack trace:\n{traceback.format_exc()}")
+            return EXIT_ERROR
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
